@@ -8,6 +8,7 @@ import {
   Pressable,
   ScrollView,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   View,
@@ -134,7 +135,12 @@ const parseChallengeRating = (value: string) => {
   return Number.parseFloat(trimmed);
 };
 
-export default function MonstersScreen({ onAddToBattle, isActive }: { onAddToBattle: (monster: Combatant) => void; isActive: boolean }) {
+export default function MonstersScreen({ onAddToBattle, isActive, selectionMode = false, onClosePicker }: {
+  onAddToBattle: (monsters: Combatant | Combatant[]) => void;
+  isActive: boolean;
+  selectionMode?: boolean;
+  onClosePicker?: () => void;
+}) {
   const [route, setRoute] = useState<RouteName>('list');
   const [monsters, setMonsters] = useState<MonsterSummary[]>([]);
   const [customMonsters, setCustomMonsters] = useState<CustomMonster[]>([]);
@@ -145,8 +151,10 @@ export default function MonstersScreen({ onAddToBattle, isActive }: { onAddToBat
   const [selectedMonster, setSelectedMonster] = useState<MonsterDetails | CustomMonster | null>(null);
   const [detailsLoading, setDetailsLoading] = useState(false);
   const [battleModalOpen, setBattleModalOpen] = useState(false);
-  const [hpMode, setHpMode] = useState<'default' | 'random'>('default');
+  const [rollHitDiceForHp, setRollHitDiceForHp] = useState(true);
   const [battleInitiative, setBattleInitiative] = useState('');
+  const [autoRollInitiative, setAutoRollInitiative] = useState(true);
+  const [monsterQuantity, setMonsterQuantity] = useState('1');
 
   const [name, setName] = useState('');
   const [size, setSize] = useState('Medium');
@@ -249,29 +257,46 @@ export default function MonstersScreen({ onAddToBattle, isActive }: { onAddToBat
     return entries.filter((monster) => monster.name.toLocaleLowerCase().includes(normalized));
   }, [entries, query]);
 
-  const openMonster = async (entry: CatalogEntry) => {
-    setRoute('details');
-    setDetailsLoading(!entry.isCustom);
+  const openBattleModalForMonster = (monster: MonsterDetails | CustomMonster) => {
+    setSelectedMonster(monster);
+    setRollHitDiceForHp(!!monster.hit_points_roll);
+    setAutoRollInitiative(true);
+    setBattleInitiative('');
+    setMonsterQuantity('1');
+    setBattleModalOpen(true);
+  };
+
+  const rollMonsterInitiative = (monster: MonsterDetails | CustomMonster) => {
+    const dexterityModifier = typeof monster.dexterity === 'number'
+      ? Math.floor((monster.dexterity - 10) / 2)
+      : 0;
+    return Math.floor(Math.random() * 20) + 1 + dexterityModifier;
+  };
+
+  const openMonster = async (entry: CatalogEntry, addDirectly = false) => {
+    if (!addDirectly) setRoute('details');
+    setDetailsLoading(!entry.isCustom && !detailCache[entry.index]);
     if (entry.isCustom) {
-      setSelectedMonster(entry);
-      setDetailsLoading(false);
+      if (addDirectly) openBattleModalForMonster(entry);
+      else setSelectedMonster(entry);
       return;
     }
     const cached = detailCache[entry.index];
     if (cached) {
-      setSelectedMonster(cached);
-      setDetailsLoading(false);
+      if (addDirectly) openBattleModalForMonster(cached);
+      else setSelectedMonster(cached);
       return;
     }
     try {
       const response = await fetch(toAbsoluteUrl(entry.url || `${API_ROOT}/monsters/${entry.index}`));
       if (!response.ok) throw new Error(`Monster detail request failed (${response.status})`);
       const details = await response.json() as MonsterDetails;
-      setSelectedMonster(details);
+      if (addDirectly) openBattleModalForMonster(details);
+      else setSelectedMonster(details);
       cacheDetails(entry.index, details);
     } catch (error) {
       console.error('Unable to load monster details', error);
-      setSelectedMonster(entry);
+      if (!addDirectly) setSelectedMonster(entry);
       Alert.alert('Could not load monster details', 'Check your connection and try opening this monster again.');
     } finally {
       setDetailsLoading(false);
@@ -393,42 +418,56 @@ export default function MonstersScreen({ onAddToBattle, isActive }: { onAddToBat
     ['WIS', selectedMonster.wisdom], ['CHA', selectedMonster.charisma],
   ] as [string, unknown][] : [];
   const openAddToBattle = () => {
-    setHpMode('default');
-    setBattleInitiative('');
-    setBattleModalOpen(true);
+    if (selectedMonster) openBattleModalForMonster(selectedMonster);
   };
 
   const addSelectedMonsterToBattle = () => {
     if (!selectedMonster) return;
-    const initiative = Number.parseInt(battleInitiative, 10);
+    const quantity = Number.parseInt(monsterQuantity, 10);
+    const manualInitiative = Number.parseInt(battleInitiative, 10);
     const ac = getArmorClass(selectedMonster.armor_class);
     const defaultHp = selectedMonster.hit_points;
-    if (!Number.isFinite(initiative) || ac === undefined || defaultHp === undefined) {
-      Alert.alert('More monster information needed', 'Enter armor class and hit points before adding this monster to battle.');
+    if (!Number.isInteger(quantity) || quantity < 1 || quantity > 99) {
+      Alert.alert('Enter a valid quantity', 'Choose a whole number between 1 and 99.');
       return;
     }
-    const hp = hpMode === 'random'
-      ? rollHitPoints(selectedMonster.hit_points_roll ?? '')
-      : defaultHp;
-    if (hp === null) {
+    if ((!autoRollInitiative && !Number.isFinite(manualInitiative)) || ac === undefined || defaultHp === undefined) {
+      Alert.alert('More information needed', 'Enter a valid initiative and make sure the monster has armor class and hit points.');
+      return;
+    }
+    if (rollHitDiceForHp && !selectedMonster.hit_points_roll) {
       Alert.alert('Hit dice are missing', 'This monster has no hit dice formula, so randomized hit points are unavailable.');
       return;
     }
-    const id = `${selectedMonster.index}-${Date.now()}`;
-    onAddToBattle({
-      id, name: selectedMonster.name, kind: 'Monster', ac, hp, maxHp: hp, initiative,
-      conditions: [],
-      resistances: selectedMonster.damage_resistances ?? [],
-      vulnerabilities: selectedMonster.damage_vulnerabilities ?? [],
-      immunities: selectedMonster.damage_immunities ?? [],
-      deathSaveSuccesses: 0, deathSaveFailures: 0, isDead: false,
-    });
+    const addedMonsters: Combatant[] = [];
+    for (let index = 0; index < quantity; index += 1) {
+      const hp = rollHitDiceForHp
+        ? rollHitPoints(selectedMonster.hit_points_roll ?? '')
+        : defaultHp;
+      if (hp === null) {
+        Alert.alert('Hit dice are invalid', 'This monster’s hit dice formula could not be rolled.');
+        return;
+      }
+      const initiative = autoRollInitiative ? rollMonsterInitiative(selectedMonster) : manualInitiative;
+      const copyName = quantity > 1 ? `${selectedMonster.name} ${index + 1}` : selectedMonster.name;
+      addedMonsters.push({
+        id: `${selectedMonster.index}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${index + 1}`,
+        name: copyName, kind: 'Monster', ac, hp, maxHp: hp, initiative,
+        conditions: [],
+        resistances: selectedMonster.damage_resistances ?? [],
+        vulnerabilities: selectedMonster.damage_vulnerabilities ?? [],
+        immunities: selectedMonster.damage_immunities ?? [],
+        deathSaveSuccesses: 0, deathSaveFailures: 0, isDead: false,
+      });
+    }
+    onAddToBattle(addedMonsters);
     setBattleModalOpen(false);
     setBattleInitiative('');
+    setMonsterQuantity('1');
     setRoute('list');
   };
 
-  const title = route === 'list' ? 'Monsters' : route === 'details' ? 'Monster Details' : 'Add Monster';
+  const title = route === 'list' ? (selectionMode ? 'Choose Monster' : 'Monsters') : route === 'details' ? 'Monster Details' : 'Add Monster';
 
   return (
     <View style={styles.container}>
@@ -437,11 +476,15 @@ export default function MonstersScreen({ onAddToBattle, isActive }: { onAddToBat
           <Pressable onPress={() => route === 'details' ? setRoute('list') : confirmDiscardAdd()} style={styles.headerSide}>
             <Text style={styles.backText}>‹ Back</Text>
           </Pressable>
+        ) : selectionMode ? (
+          <Pressable accessibilityRole="button" onPress={onClosePicker} style={styles.headerSide}>
+            <Text style={styles.backText}>Cancel</Text>
+          </Pressable>
         ) : <View style={styles.headerSide} />}
         <Text style={styles.headerTitle}>{title}</Text>
-        {route === 'list' ? (
+        {route === 'list' && !selectionMode ? (
           <Pressable accessibilityLabel="Add monster" onPress={beginAdd} style={styles.addIconButton}>
-            <Text style={styles.addIcon}>+</Text>
+            <Text style={styles.addButtonText}>+ Add</Text>
           </Pressable>
         ) : <View style={styles.headerSide} />}
       </View>
@@ -487,6 +530,7 @@ export default function MonstersScreen({ onAddToBattle, isActive }: { onAddToBat
                   cachedDetails={item.isCustom ? item : detailCache[item.index]}
                   onDetailsLoaded={cacheDetails}
                   onPress={() => void openMonster(item)}
+                  onQuickAdd={() => void openMonster(item, true)}
                 />
               )}
             />
@@ -623,35 +667,86 @@ export default function MonstersScreen({ onAddToBattle, isActive }: { onAddToBat
           <View style={styles.battleModal}>
             <Text style={styles.modalTitle}>Add to Battle</Text>
             <Text style={styles.modalSubtitle}>{selectedMonster?.name}</Text>
-            <Text style={styles.fieldLabel}>Hit points</Text>
-            <Pressable onPress={() => setHpMode('default')} style={styles.choiceRow}>
-              <Text style={styles.choiceText}>Use default ({selectedMonster?.hit_points ?? '—'} HP)</Text>
-              <Text style={styles.choiceMark}>{hpMode === 'default' ? '●' : '○'}</Text>
-            </Pressable>
-            {selectedMonster?.hit_points_roll ? (
-              <Pressable onPress={() => setHpMode('random')} style={styles.choiceRow}>
-                <Text style={styles.choiceText}>Roll hit dice ({selectedMonster.hit_points_roll})</Text>
-                <Text style={styles.choiceMark}>{hpMode === 'random' ? '●' : '○'}</Text>
+            <View style={styles.hpToggleRow}>
+              <View style={styles.initiativeToggleCopy}>
+                <Text style={styles.fieldLabel}>Roll hit dice</Text>
+                <Text style={styles.modalHint}>
+                  {selectedMonster?.hit_points_roll
+                    ? `${selectedMonster.hit_points_roll} · off uses default (${selectedMonster.hit_points ?? '—'} HP)`
+                    : `No hit dice formula · using default (${selectedMonster?.hit_points ?? '—'} HP)`}
+                </Text>
+              </View>
+              <Switch
+                accessibilityLabel="Roll hit dice for hit points"
+                disabled={!selectedMonster?.hit_points_roll}
+                onValueChange={setRollHitDiceForHp}
+                thumbColor={rollHitDiceForHp ? '#fff' : '#D0CEDC'}
+                trackColor={{ false: '#514F67', true: palette.green }}
+                value={rollHitDiceForHp}
+              />
+            </View>
+            <Text style={[styles.fieldLabel, styles.quantityLabel]}>Number to add</Text>
+            <View style={styles.quantityControl}>
+              <Pressable
+                accessibilityLabel="Decrease quantity"
+                accessibilityRole="button"
+                disabled={Number.parseInt(monsterQuantity, 10) <= 1}
+                onPress={() => setMonsterQuantity((value) => String(Math.max(1, (Number.parseInt(value, 10) || 1) - 1)))}
+                style={styles.quantityButton}
+              >
+                <Text style={styles.quantityButtonText}>−</Text>
               </Pressable>
-            ) : (
-              <Text style={styles.modalHint}>No hit dice formula is available for random HP.</Text>
+              <TextInput
+                accessibilityLabel="Monster quantity"
+                keyboardType="number-pad"
+                onChangeText={(value) => setMonsterQuantity(value.replace(/\D/g, ''))}
+                selectTextOnFocus
+                style={styles.quantityInput}
+                value={monsterQuantity}
+              />
+              <Pressable
+                accessibilityLabel="Increase quantity"
+                accessibilityRole="button"
+                disabled={Number.parseInt(monsterQuantity, 10) >= 99}
+                onPress={() => setMonsterQuantity((value) => String(Math.min(99, (Number.parseInt(value, 10) || 1) + 1)))}
+                style={styles.quantityButton}
+              >
+                <Text style={styles.quantityButtonText}>+</Text>
+              </Pressable>
+            </View>
+            <View style={[styles.initiativeToggleRow, styles.initiativeLabel]}>
+              <View style={styles.initiativeToggleCopy}>
+                <Text style={styles.fieldLabel}>Auto roll initiative</Text>
+                <Text style={styles.modalHint}>Roll d20 + DEX modifier when adding</Text>
+              </View>
+              <Switch
+                accessibilityLabel="Auto roll initiative"
+                onValueChange={setAutoRollInitiative}
+                thumbColor={autoRollInitiative ? '#fff' : '#D0CEDC'}
+                trackColor={{ false: '#514F67', true: palette.green }}
+                value={autoRollInitiative}
+              />
+            </View>
+            {!autoRollInitiative && (
+              <>
+                <Text style={styles.fieldLabel}>Initiative *</Text>
+                <TextInput
+                  autoFocus
+                  keyboardType="numbers-and-punctuation"
+                  onChangeText={setBattleInitiative}
+                  placeholder="Enter the initiative roll"
+                  placeholderTextColor={palette.muted}
+                  style={styles.fieldInput}
+                  value={battleInitiative}
+                />
+              </>
             )}
-            <Text style={[styles.fieldLabel, styles.initiativeLabel]}>Initiative *</Text>
-            <TextInput
-              autoFocus
-              keyboardType="number-pad"
-              onChangeText={setBattleInitiative}
-              placeholder="Enter the initiative roll"
-              placeholderTextColor={palette.muted}
-              style={styles.fieldInput}
-              value={battleInitiative}
-            />
             <View style={styles.modalActions}>
               <Pressable onPress={() => setBattleModalOpen(false)} style={styles.cancelModalButton}>
                 <Text style={styles.cancelModalText}>Cancel</Text>
               </Pressable>
               <Pressable onPress={addSelectedMonsterToBattle} style={styles.saveButton}>
-                <Text style={styles.saveButtonText}>Add Monster</Text>
+                <Text style={styles.saveButtonText}>Add {Number.parseInt(monsterQuantity, 10) || 1} {Number.parseInt(monsterQuantity, 10) === 1 ? 'Monster' : 'Monsters'}</Text>
               </Pressable>
             </View>
           </View>
@@ -663,12 +758,13 @@ export default function MonstersScreen({ onAddToBattle, isActive }: { onAddToBat
 
 
 function MonsterCard({
-  entry, cachedDetails, onDetailsLoaded, onPress,
+  entry, cachedDetails, onDetailsLoaded, onPress, onQuickAdd,
 }: {
   entry: CatalogEntry;
   cachedDetails?: MonsterDetails;
   onDetailsLoaded: (index: string, details: MonsterDetails) => void;
   onPress: () => void;
+  onQuickAdd: () => void;
 }) {
   useEffect(() => {
     if (entry.isCustom || cachedDetails) return undefined;
@@ -693,14 +789,27 @@ function MonsterCard({
     : entry.isCustom ? 'Custom monster' : 'D&D 5e SRD';
 
   return (
-    <Pressable onPress={onPress} style={styles.monsterCard}>
-      <View style={styles.monsterMark}><Text style={styles.monsterMarkText}>{entry.name.slice(0, 1).toUpperCase()}</Text></View>
-      <View style={styles.monsterCardText}>
-        <Text numberOfLines={1} style={styles.monsterName}>{entry.name}</Text>
-        <Text numberOfLines={1} style={styles.monsterMeta}>{meta}</Text>
-      </View>
-      <Text style={styles.chevron}>›</Text>
-    </Pressable>
+    <View style={styles.monsterCard}>
+      <Pressable accessibilityRole="button" onPress={onPress} style={styles.monsterCardDetails}>
+        <View style={styles.monsterMark}><Text style={styles.monsterMarkText}>{entry.name.slice(0, 1).toUpperCase()}</Text></View>
+        <View style={styles.monsterCardText}>
+          <Text numberOfLines={1} style={styles.monsterName}>{entry.name}</Text>
+          <Text numberOfLines={1} style={styles.monsterMeta}>{meta}</Text>
+        </View>
+      </Pressable>
+      <Pressable
+        accessibilityLabel={`Add ${entry.name} to battle`}
+        accessibilityRole="button"
+        hitSlop={6}
+        onPress={onQuickAdd}
+        style={styles.monsterQuickAdd}
+      >
+        <Text style={styles.monsterQuickAddText}>+</Text>
+      </Pressable>
+      <Pressable accessibilityLabel={`View ${entry.name} details`} accessibilityRole="button" onPress={onPress} style={styles.monsterDetailsArrow}>
+        <Text style={styles.chevron}>›</Text>
+      </Pressable>
+    </View>
   );
 }
 
@@ -889,8 +998,8 @@ const styles = StyleSheet.create({
   headerSide: { width: 68, justifyContent: 'center' },
   headerTitle: { color: palette.text, fontSize: 15, fontWeight: '700' },
   backText: { color: palette.text, fontSize: 13 },
-  addIconButton: { width: 36, alignItems: 'flex-end', justifyContent: 'center' },
-  addIcon: { color: palette.text, fontSize: 29, fontWeight: '300', lineHeight: 32 },
+  addIconButton: { width: 68, height: 27, borderRadius: 6, backgroundColor: palette.green, alignItems: 'center', justifyContent: 'center' },
+  addButtonText: { color: '#fff', fontSize: 11, fontWeight: '700' },
   searchArea: { paddingHorizontal: 12, paddingTop: 11, paddingBottom: 7 },
   searchInput: {
     minHeight: 40, backgroundColor: '#222137', borderRadius: 9, borderWidth: 1,
@@ -900,8 +1009,12 @@ const styles = StyleSheet.create({
   listContent: { paddingHorizontal: 10, paddingBottom: 12, gap: 7 },
   monsterCard: {
     minHeight: 62, paddingHorizontal: 10, paddingVertical: 8, borderRadius: 10,
-    backgroundColor: palette.card, flexDirection: 'row', alignItems: 'center', gap: 9,
+    backgroundColor: palette.card, flexDirection: 'row', alignItems: 'center', gap: 7,
   },
+  monsterCardDetails: { flex: 1, minWidth: 0, flexDirection: 'row', alignItems: 'center', gap: 9 },
+  monsterQuickAdd: { width: 34, height: 34, borderRadius: 9, backgroundColor: palette.green, alignItems: 'center', justifyContent: 'center' },
+  monsterQuickAddText: { color: '#fff', fontSize: 25, fontWeight: '500', lineHeight: 28, marginTop: -2 },
+  monsterDetailsArrow: { width: 16, alignItems: 'flex-end', justifyContent: 'center' },
   monsterMark: {
     width: 37, height: 37, borderRadius: 10, backgroundColor: '#403E5D',
     alignItems: 'center', justifyContent: 'center',
@@ -973,11 +1086,16 @@ const styles = StyleSheet.create({
   battleModal: { padding: 16, borderRadius: 13, backgroundColor: palette.card, borderWidth: 1, borderColor: palette.border },
   modalTitle: { color: palette.text, fontSize: 18, fontWeight: '800' },
   modalSubtitle: { color: palette.muted, fontSize: 12, marginTop: 3, marginBottom: 13 },
-  choiceRow: { minHeight: 39, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: palette.border },
-  choiceText: { color: palette.text, fontSize: 12 },
-  choiceMark: { color: palette.pink, fontSize: 17 },
+  hpToggleRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   modalHint: { color: palette.muted, fontSize: 10, marginTop: 7 },
+  quantityLabel: { marginTop: 13 },
+  quantityControl: { flexDirection: 'row', alignItems: 'center', alignSelf: 'flex-start', borderRadius: 8, overflow: 'hidden', backgroundColor: '#222137', borderWidth: 1, borderColor: palette.border },
+  quantityButton: { width: 42, height: 40, alignItems: 'center', justifyContent: 'center', backgroundColor: '#34324E' },
+  quantityButtonText: { color: palette.text, fontSize: 23, lineHeight: 27, fontWeight: '600' },
+  quantityInput: { width: 54, height: 40, color: palette.text, fontSize: 16, fontWeight: '700', textAlign: 'center', padding: 0 },
   initiativeLabel: { marginTop: 14 },
+  initiativeToggleRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  initiativeToggleCopy: { flex: 1 },
   modalActions: { flexDirection: 'row', alignItems: 'center', justifyContent: 'flex-end', gap: 5, marginTop: 4 },
   cancelModalButton: { paddingHorizontal: 10, paddingVertical: 10 },
   cancelModalText: { color: palette.muted, fontWeight: '600' },

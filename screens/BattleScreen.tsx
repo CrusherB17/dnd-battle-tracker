@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   Alert,
   Modal,
@@ -30,26 +31,10 @@ const conditionOptions = [
   'Stunned', 'Unconscious',
 ];
 
-const startingCombatants: Combatant[] = [
-  {
-    id: 'brass-dragon', name: 'Adult Brass Dragon 1', kind: 'Monster', ac: 18,
-    hp: 145, maxHp: 145, initiative: 15, conditions: [],
-    resistances: [], vulnerabilities: [], immunities: [],
-    deathSaveSuccesses: 0, deathSaveFailures: 0, isDead: false,
-  },
-  {
-    id: 'sonny', name: 'Sonny', kind: 'Player', ac: 15,
-    hp: 15, maxHp: 15, initiative: 12, conditions: ['Charmed', 'Blinded'],
-    resistances: [], vulnerabilities: [], immunities: [],
-    deathSaveSuccesses: 0, deathSaveFailures: 0, isDead: false,
-  },
-  {
-    id: 'black-dragon', name: 'Adult Black Dragon 1', kind: 'Monster', ac: 19,
-    hp: 182, maxHp: 182, initiative: 10, conditions: [],
-    resistances: [], vulnerabilities: [], immunities: [],
-    deathSaveSuccesses: 0, deathSaveFailures: 0, isDead: false,
-  },
-];
+const BATTLE_STATE_KEY = '@dnd-battle-tracker/active-battle-v1';
+const SAVED_PLAYERS_KEY = '@dnd-battle-tracker/players-v1';
+
+type SavedPlayer = { id: string; name: string; ac: number; maxHp: number };
 
 function adjustedDamage(target: Combatant, amount: number, type: DamageType | null) {
   if (!type) return amount;
@@ -63,13 +48,39 @@ function adjustedDamage(target: Combatant, amount: number, type: DamageType | nu
   return amount;
 }
 
-export default function BattleScreen({ incomingMonster }: { incomingMonster: Combatant | null }) {
-  const [combatants, setCombatants] = useState(startingCombatants);
-  const [activeIndex, setActiveIndex] = useState(2);
+function rollDiceFormula(formula: string): number | null {
+  const match = formula.trim().match(/^(\d+)d(\d+)(?:\s*([+-])\s*(\d+))?$/i);
+  if (!match) return null;
+  const count = Number(match[1]);
+  const sides = Number(match[2]);
+  const modifier = Number(match[4] ?? 0) * (match[3] === '-' ? -1 : 1);
+  if (count < 1 || count > 100 || sides < 2 || sides > 1000) return null;
+  let total = modifier;
+  for (let die = 0; die < count; die += 1) total += Math.floor(Math.random() * sides) + 1;
+  return Math.max(0, total);
+}
+
+export default function BattleScreen({ incomingMonsters, onOpenMonsters }: { incomingMonsters: Combatant[]; onOpenMonsters: () => void }) {
+  const [combatants, setCombatants] = useState<Combatant[]>([]);
+  const [activeIndex, setActiveIndex] = useState(0);
   const [round, setRound] = useState(1);
+  const [battleLoaded, setBattleLoaded] = useState(false);
+  const [savedPlayers, setSavedPlayers] = useState<SavedPlayer[]>([]);
+  const [playersLoaded, setPlayersLoaded] = useState(false);
+  const [playerPickerOpen, setPlayerPickerOpen] = useState(false);
+  const [playerSearch, setPlayerSearch] = useState('');
+  const [selectedSavedPlayer, setSelectedSavedPlayer] = useState<SavedPlayer | null>(null);
+  const [savedPlayerInitiative, setSavedPlayerInitiative] = useState('');
+  const [addPlayerOpen, setAddPlayerOpen] = useState(false);
+  const [playerName, setPlayerName] = useState('');
+  const [playerAc, setPlayerAc] = useState('');
+  const [playerHp, setPlayerHp] = useState('');
+  const [playerInitiative, setPlayerInitiative] = useState('');
   const [healthTargetId, setHealthTargetId] = useState<string | null>(null);
   const [healthAction, setHealthAction] = useState<HealthAction>('damage');
   const [healthAmount, setHealthAmount] = useState('');
+  const [diceFormula, setDiceFormula] = useState('');
+  const [diceRollResult, setDiceRollResult] = useState<number | null>(null);
   const [damageType, setDamageType] = useState<DamageType | null>(null);
   const [conditionTargetId, setConditionTargetId] = useState<string | null>(null);
   const [selectedConditions, setSelectedConditions] = useState<string[]>([]);
@@ -80,19 +91,100 @@ export default function BattleScreen({ incomingMonster }: { incomingMonster: Com
   );
 
   useEffect(() => {
-    if (!incomingMonster || combatants.some((item) => item.id === incomingMonster.id)) return;
+    let mounted = true;
+    const restoreBattle = async () => {
+      try {
+        const saved = await AsyncStorage.getItem(BATTLE_STATE_KEY);
+        if (!mounted || !saved) return;
+        const battle = JSON.parse(saved) as { combatants?: Combatant[]; round?: number; activeId?: string };
+        if (Array.isArray(battle.combatants)) setCombatants(battle.combatants);
+        if (Number.isInteger(battle.round) && (battle.round ?? 0) > 0) setRound(battle.round as number);
+        if (battle.activeId) {
+          const index = [...(battle.combatants ?? [])].sort((a, b) => b.initiative - a.initiative).findIndex((item) => item.id === battle.activeId);
+          if (index >= 0) setActiveIndex(index);
+        }
+      } catch (error) {
+        console.warn('Unable to restore battle state', error);
+      } finally {
+        if (mounted) setBattleLoaded(true);
+      }
+    };
+    void restoreBattle();
+    return () => { mounted = false; };
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    void AsyncStorage.getItem(SAVED_PLAYERS_KEY).then((saved) => {
+      if (!mounted) return;
+      if (saved) {
+        const parsed = JSON.parse(saved) as SavedPlayer[];
+        if (Array.isArray(parsed)) setSavedPlayers(parsed);
+      }
+    }).catch((error) => console.warn('Unable to restore saved players', error))
+      .finally(() => { if (mounted) setPlayersLoaded(true); });
+    return () => { mounted = false; };
+  }, []);
+
+  useEffect(() => {
+    if (!playersLoaded) return;
+    void AsyncStorage.setItem(SAVED_PLAYERS_KEY, JSON.stringify(savedPlayers))
+      .catch((error) => console.warn('Unable to save players', error));
+  }, [playersLoaded, savedPlayers]);
+
+  useEffect(() => {
+    if (!battleLoaded) return;
     const activeId = orderedCombatants[activeIndex]?.id;
-    const updatedCombatants = [...combatants, incomingMonster];
+    void AsyncStorage.setItem(BATTLE_STATE_KEY, JSON.stringify({ combatants, round, activeId }))
+      .catch((error) => console.warn('Unable to save battle state', error));
+  }, [battleLoaded, combatants, round, activeIndex, orderedCombatants]);
+
+  useEffect(() => {
+    if (!battleLoaded) return;
+    const additions = incomingMonsters.filter((incoming) => !combatants.some((item) => item.id === incoming.id));
+    if (additions.length === 0) return;
+    const activeId = orderedCombatants[activeIndex]?.id;
+    const updatedCombatants = [...combatants, ...additions];
     const updatedOrder = [...updatedCombatants].sort((a, b) => b.initiative - a.initiative);
     setCombatants(updatedCombatants);
     const preservedActiveIndex = activeId
       ? updatedOrder.findIndex((item) => item.id === activeId)
       : 0;
     setActiveIndex(Math.max(0, preservedActiveIndex));
-  }, [incomingMonster, combatants, orderedCombatants, activeIndex]);
+  }, [battleLoaded, incomingMonsters, combatants, orderedCombatants, activeIndex]);
 
   const healthTarget = combatants.find((combatant) => combatant.id === healthTargetId);
   const conditionTarget = combatants.find((combatant) => combatant.id === conditionTargetId);
+  const filteredSavedPlayers = useMemo(() => {
+    const normalized = playerSearch.trim().toLocaleLowerCase();
+    return savedPlayers.filter((player) => !normalized || player.name.toLocaleLowerCase().includes(normalized));
+  }, [savedPlayers, playerSearch]);
+
+  const addPlayerCombatant = (player: SavedPlayer, initiative: number) => {
+    const combatant: Combatant = {
+      id: `player-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      name: player.name, kind: 'Player', ac: player.ac, hp: player.maxHp, maxHp: player.maxHp, initiative,
+      conditions: [], resistances: [], vulnerabilities: [], immunities: [],
+      deathSaveSuccesses: 0, deathSaveFailures: 0, isDead: false,
+    };
+    const activeId = orderedCombatants[activeIndex]?.id;
+    const updated = [...combatants, combatant];
+    const updatedOrder = [...updated].sort((a, b) => b.initiative - a.initiative);
+    setCombatants(updated);
+    setActiveIndex(activeId ? Math.max(0, updatedOrder.findIndex((item) => item.id === activeId)) : 0);
+  };
+
+  const addSelectedPlayer = () => {
+    const initiative = Number.parseInt(savedPlayerInitiative, 10);
+    if (!selectedSavedPlayer || !Number.isInteger(initiative)) {
+      Alert.alert('Enter initiative', 'Enter the initiative this player rolled.');
+      return;
+    }
+    addPlayerCombatant(selectedSavedPlayer, initiative);
+    setSelectedSavedPlayer(null);
+    setSavedPlayerInitiative('');
+    setPlayerPickerOpen(false);
+  };
 
   const updateHealth = () => {
     const amount = Number.parseInt(healthAmount, 10);
@@ -105,21 +197,21 @@ export default function BattleScreen({ incomingMonster }: { incomingMonster: Com
       : amount;
     setCombatants((current) => current.map((combatant) => {
       if (combatant.id !== healthTarget.id) return combatant;
+      const hp = healthAction === 'damage'
+        ? Math.max(0, combatant.hp - effectiveAmount)
+        : Math.min(combatant.maxHp, combatant.hp + effectiveAmount);
+      const revived = healthAction === 'heal' && combatant.hp === 0 && hp > 0;
+      const newlyDown = healthAction === 'damage' && combatant.hp > 0 && hp === 0;
       return {
         ...combatant,
-        hp: healthAction === 'damage'
-          ? Math.max(0, combatant.hp - effectiveAmount)
-          : Math.min(combatant.maxHp, combatant.hp + effectiveAmount),
+        hp,
+        ...(revived || newlyDown ? { deathSaveSuccesses: 0, deathSaveFailures: 0, isDead: false } : {}),
       };
     }));
     setHealthTargetId(null);
     setHealthAmount('');
+    setDiceFormula(''); setDiceRollResult(null);
     setDamageType(null);
-    if (healthAction === 'damage' && healthTarget.kind === 'Player' && healthTarget.hp > 0 && healthTarget.hp - effectiveAmount <= 0) {
-      setCombatants((current) => current.map((combatant) => combatant.id === healthTarget.id
-        ? { ...combatant, deathSaveSuccesses: 0, deathSaveFailures: 0, isDead: false }
-        : combatant));
-    }
   };
 
   const rollDeathSave = (combatant: Combatant) => {
@@ -137,7 +229,7 @@ export default function BattleScreen({ incomingMonster }: { incomingMonster: Com
         ...item,
         deathSaveSuccesses: Math.min(3, successes),
         deathSaveFailures: Math.min(3, failures),
-        isDead: failures >= 3,
+        isDead: item.deathSaveFailures + (roll === 1 ? 2 : roll < 10 ? 1 : 0) >= 3,
       };
     }));
     const result = roll === 20
@@ -152,6 +244,7 @@ export default function BattleScreen({ incomingMonster }: { incomingMonster: Com
     setHealthTargetId(combatant.id);
     setHealthAction(action);
     setHealthAmount('');
+    setDiceFormula(''); setDiceRollResult(null);
     setDamageType(null);
   };
 
@@ -170,6 +263,23 @@ export default function BattleScreen({ incomingMonster }: { incomingMonster: Com
     setConditionTargetId(null);
   };
 
+  const savePlayer = () => {
+    const name = playerName.trim();
+    const ac = Number.parseInt(playerAc, 10);
+    const hp = Number.parseInt(playerHp, 10);
+    const initiative = Number.parseInt(playerInitiative, 10);
+    if (!name || !Number.isInteger(ac) || ac < 0 || !Number.isInteger(hp) || hp < 1 || !Number.isInteger(initiative)) {
+      Alert.alert('Complete the required fields', 'Enter the player name, AC, maximum HP, and initiative roll.');
+      return;
+    }
+    const player = { id: `saved-player-${Date.now()}`, name, ac, maxHp: hp };
+    setSavedPlayers((current) => [...current, player]);
+    addPlayerCombatant(player, initiative);
+    setAddPlayerOpen(false);
+    setPlayerName(''); setPlayerAc(''); setPlayerHp(''); setPlayerInitiative('');
+    setPlayerPickerOpen(false);
+  };
+
   const moveTurn = (direction: -1 | 1) => {
     if (orderedCombatants.length === 0) return;
     const nextIndex = activeIndex + direction;
@@ -185,14 +295,20 @@ export default function BattleScreen({ incomingMonster }: { incomingMonster: Com
   };
 
   const endBattle = () => {
-    Alert.alert('End battle?', 'This will reset the round and turn order.', [
+    Alert.alert('End battle?', 'This will clear the combatants and reset the round.', [
       { text: 'Keep battling', style: 'cancel' },
       {
         text: 'End battle', style: 'destructive',
-        onPress: () => { setRound(1); setActiveIndex(0); },
+        onPress: () => { setCombatants([]); setRound(1); setActiveIndex(0); },
       },
     ]);
   };
+
+  const openAddMenu = () => Alert.alert('Add to Battle', 'Choose what to add.', [
+    { text: 'Monster', onPress: onOpenMonsters },
+    { text: 'Player', onPress: () => setPlayerPickerOpen(true) },
+    { text: 'Cancel', style: 'cancel' },
+  ]);
 
   const removeCombatant = (combatant: Combatant) => {
     Alert.alert(`Remove ${combatant.name}?`, 'This combatant will leave the encounter.', [
@@ -212,6 +328,9 @@ export default function BattleScreen({ incomingMonster }: { incomingMonster: Com
       <View style={styles.screen}>
         <View style={styles.header}>
           <Text style={styles.headerTitle}>Battle</Text>
+          <Pressable accessibilityRole="button" disabled={!battleLoaded} onPress={openAddMenu} style={styles.addPlayerButton}>
+            <Text style={styles.addPlayerButtonText}>+ Add</Text>
+          </Pressable>
         </View>
 
         <>
@@ -243,7 +362,7 @@ export default function BattleScreen({ incomingMonster }: { incomingMonster: Com
                       </View>
                       <View style={styles.combatantDetails}>
                         <Text numberOfLines={1} style={styles.combatantName}>{combatant.name}</Text>
-                        <Text style={styles.combatantMeta}>{combatant.kind}</Text>
+                <Text style={styles.combatantMeta}>{combatant.kind} · Init {combatant.initiative}</Text>
                       </View>
                       <Pressable
                         accessibilityLabel={`Remove ${combatant.name}`}
@@ -294,7 +413,10 @@ export default function BattleScreen({ incomingMonster }: { incomingMonster: Com
                         ))}
                       </View>
                     )}
-                    {combatant.kind === 'Player' && combatant.hp === 0 && !combatant.isDead && (
+                    {combatant.kind === 'Player' && combatant.hp === 0 && combatant.deathSaveSuccesses >= 3 && !combatant.isDead && (
+                      <Text style={styles.stableText}>Stable · 3 successful death saves</Text>
+                    )}
+                    {combatant.kind === 'Player' && combatant.hp === 0 && combatant.deathSaveSuccesses < 3 && !combatant.isDead && (
                       <View style={styles.deathSavePanel}>
                         <View style={styles.deathSaveHeader}>
                           <Text style={styles.deathSaveTitle}>Death saves</Text>
@@ -314,7 +436,10 @@ export default function BattleScreen({ incomingMonster }: { incomingMonster: Com
                 );
               })}
               {orderedCombatants.length === 0 && (
-                <Text style={styles.emptyText}>Add combatants to begin a battle.</Text>
+                <View style={styles.emptyPanel}>
+                  <Text style={styles.emptyTitle}>{battleLoaded ? 'Ready when you are' : 'Loading battle…'}</Text>
+                  {battleLoaded ? <Text style={styles.emptyText}>Tap + Add to search saved players or monsters and add them to the encounter.</Text> : null}
+                </View>
               )}
             </ScrollView>
 
@@ -332,6 +457,118 @@ export default function BattleScreen({ incomingMonster }: { incomingMonster: Com
 
       <Modal
         animationType="fade"
+        onRequestClose={() => { setPlayerPickerOpen(false); setPlayerSearch(''); }}
+        transparent
+        visible={playerPickerOpen}
+      >
+        <View style={styles.modalScrim}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Choose Player</Text>
+            <Text style={styles.modalSubtitle}>Search your saved players, then enter their initiative roll.</Text>
+            <TextInput
+              accessibilityLabel="Search saved players"
+              autoFocus
+              onChangeText={setPlayerSearch}
+              placeholder="Search players"
+              placeholderTextColor={colors.muted}
+              returnKeyType="search"
+              style={styles.playerSearchInput}
+              value={playerSearch}
+            />
+            <ScrollView keyboardShouldPersistTaps="handled" style={styles.playerPickerList}>
+              {filteredSavedPlayers.map((player) => (
+                <Pressable
+                  key={player.id}
+                  onPress={() => { setSelectedSavedPlayer(player); setSavedPlayerInitiative(''); }}
+                  style={styles.playerPickerRow}
+                >
+                  <View style={styles.playerPickerInfo}>
+                    <Text style={styles.playerPickerName}>{player.name}</Text>
+                    <Text style={styles.playerPickerMeta}>AC {player.ac} · {player.maxHp} HP</Text>
+                  </View>
+                  <Text style={styles.playerPickerChevron}>›</Text>
+                </Pressable>
+              ))}
+              {filteredSavedPlayers.length === 0 && (
+                <Text style={styles.playerPickerEmpty}>
+                  {savedPlayers.length === 0 ? 'No saved players yet. Create one to reuse it in future battles.' : 'No players match your search.'}
+                </Text>
+              )}
+            </ScrollView>
+            <View style={styles.modalActions}>
+              <Pressable onPress={() => { setPlayerPickerOpen(false); setPlayerSearch(''); }} style={styles.cancelButton}>
+                <Text style={styles.cancelText}>Cancel</Text>
+              </Pressable>
+              <Pressable onPress={() => setAddPlayerOpen(true)} style={styles.confirmButton}>
+                <Text style={styles.confirmText}>+ Create Player</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        animationType="fade"
+        onRequestClose={() => setSelectedSavedPlayer(null)}
+        transparent
+        visible={selectedSavedPlayer !== null}
+      >
+        <View style={styles.modalScrim}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>{selectedSavedPlayer?.name}</Text>
+            <Text style={styles.modalSubtitle}>AC {selectedSavedPlayer?.ac} · {selectedSavedPlayer?.maxHp} HP</Text>
+            <Text style={styles.fieldLabel}>Initiative roll *</Text>
+            <TextInput
+              autoFocus
+              keyboardType="numbers-and-punctuation"
+              onChangeText={setSavedPlayerInitiative}
+              placeholder="Enter their total initiative"
+              placeholderTextColor={colors.muted}
+              style={styles.formInput}
+              value={savedPlayerInitiative}
+            />
+            <View style={styles.modalActions}>
+              <Pressable onPress={() => setSelectedSavedPlayer(null)} style={styles.cancelButton}><Text style={styles.cancelText}>Back</Text></Pressable>
+              <Pressable onPress={addSelectedPlayer} style={styles.confirmButton}><Text style={styles.confirmText}>Add to Battle</Text></Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        animationType="fade"
+        onRequestClose={() => setAddPlayerOpen(false)}
+        transparent
+        visible={addPlayerOpen}
+      >
+        <View style={styles.modalScrim}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Create Player</Text>
+            <Text style={styles.modalSubtitle}>Save this player for future battles and add them now.</Text>
+            <Text style={styles.fieldLabel}>Name *</Text>
+            <TextInput autoFocus onChangeText={setPlayerName} placeholder="Player name" placeholderTextColor={colors.muted} style={styles.formInput} value={playerName} />
+            <View style={styles.playerNumberRow}>
+              <View style={styles.playerNumberField}>
+                <Text style={styles.fieldLabel}>Armor class *</Text>
+                <TextInput keyboardType="number-pad" onChangeText={setPlayerAc} placeholder="15" placeholderTextColor={colors.muted} style={styles.formInput} value={playerAc} />
+              </View>
+              <View style={styles.playerNumberField}>
+                <Text style={styles.fieldLabel}>Maximum HP *</Text>
+                <TextInput keyboardType="number-pad" onChangeText={setPlayerHp} placeholder="24" placeholderTextColor={colors.muted} style={styles.formInput} value={playerHp} />
+              </View>
+            </View>
+            <Text style={styles.fieldLabel}>Initiative roll *</Text>
+            <TextInput keyboardType="numbers-and-punctuation" onChangeText={setPlayerInitiative} placeholder="Enter their total initiative" placeholderTextColor={colors.muted} style={styles.formInput} value={playerInitiative} />
+            <View style={styles.modalActions}>
+              <Pressable onPress={() => setAddPlayerOpen(false)} style={styles.cancelButton}><Text style={styles.cancelText}>Cancel</Text></Pressable>
+              <Pressable onPress={savePlayer} style={styles.confirmButton}><Text style={styles.confirmText}>Save & Add</Text></Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        animationType="fade"
         onRequestClose={() => setHealthTargetId(null)}
         transparent
         visible={healthTargetId !== null}
@@ -343,7 +580,6 @@ export default function BattleScreen({ incomingMonster }: { incomingMonster: Com
             </Text>
             <Text style={styles.modalSubtitle}>{healthTarget?.name}</Text>
             <TextInput
-              autoFocus
               keyboardType="number-pad"
               onChangeText={setHealthAmount}
               placeholder="Amount"
@@ -351,6 +587,27 @@ export default function BattleScreen({ incomingMonster }: { incomingMonster: Com
               style={styles.amountInput}
               value={healthAmount}
             />
+            <View style={styles.diceRollRow}>
+              <TextInput
+                accessibilityLabel="Dice formula"
+                onChangeText={(value) => { setDiceFormula(value); setDiceRollResult(null); }}
+                placeholder="Roll dice, e.g. 2d6+3"
+                placeholderTextColor={colors.muted}
+                style={[styles.amountInput, styles.diceFormulaInput]}
+                value={diceFormula}
+              />
+              <Pressable onPress={() => {
+                const result = rollDiceFormula(diceFormula);
+                if (result === null) {
+                  Alert.alert('Invalid dice formula', 'Use a formula such as 2d6+3 or 1d8-1.');
+                  return;
+                }
+                setHealthAmount(String(result)); setDiceRollResult(result);
+              }} style={styles.rollDiceButton}>
+                <Text style={styles.rollDiceText}>Roll</Text>
+              </Pressable>
+            </View>
+            {diceRollResult !== null ? <Text style={styles.damageNote}>Rolled total: {diceRollResult}</Text> : null}
             {healthAction === 'damage' && (
               <>
                 <Text style={styles.fieldLabel}>Damage type (optional)</Text>
@@ -447,10 +704,12 @@ const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: colors.header },
   screen: { flex: 1, backgroundColor: colors.background },
   header: {
-    height: 43, alignItems: 'center', justifyContent: 'center',
+    height: 43, alignItems: 'center', justifyContent: 'center', position: 'relative',
     backgroundColor: colors.header,
   },
   headerTitle: { color: colors.text, fontSize: 15, fontWeight: '600' },
+  addPlayerButton: { position: 'absolute', top: 8, right: 10, height: 27, paddingHorizontal: 10, borderRadius: 6, backgroundColor: colors.green, alignItems: 'center', justifyContent: 'center' },
+  addPlayerButtonText: { color: '#fff', fontSize: 11, fontWeight: '700' },
   roundHeader: {
     minHeight: 61, paddingHorizontal: 12, paddingVertical: 9,
     flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
@@ -522,6 +781,9 @@ const styles = StyleSheet.create({
   rollSaveText: { color: colors.text, fontSize: 10, fontWeight: '600' },
   deadText: { color: colors.red, marginTop: 7, fontSize: 10, fontWeight: '700' },
   emptyText: { color: colors.muted, textAlign: 'center', padding: 24 },
+  emptyPanel: { marginTop: 24, alignItems: 'center', paddingHorizontal: 20, gap: 5 },
+  emptyTitle: { color: colors.text, fontSize: 15, fontWeight: '700' },
+  stableText: { color: colors.green, marginTop: 7, fontSize: 10, fontWeight: '700' },
   modalScrim: { flex: 1, backgroundColor: '#0009', justifyContent: 'center', padding: 20 },
   modalCard: {
     backgroundColor: colors.card, borderRadius: 14, padding: 16,
@@ -529,10 +791,25 @@ const styles = StyleSheet.create({
   },
   modalTitle: { color: colors.text, fontSize: 19, fontWeight: '700' },
   modalSubtitle: { color: colors.muted, fontSize: 12, marginTop: 3, marginBottom: 13 },
+  playerSearchInput: { backgroundColor: '#1D1C31', borderWidth: 1, borderColor: colors.border, borderRadius: 8, color: colors.text, fontSize: 14, paddingHorizontal: 11, paddingVertical: 9 },
+  playerPickerList: { maxHeight: 300, marginTop: 8 },
+  playerPickerRow: { minHeight: 50, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: colors.border, paddingHorizontal: 4 },
+  playerPickerInfo: { flex: 1, gap: 3 },
+  playerPickerName: { color: colors.text, fontSize: 13, fontWeight: '700' },
+  playerPickerMeta: { color: colors.muted, fontSize: 10 },
+  playerPickerChevron: { color: colors.pink, fontSize: 24, paddingHorizontal: 6 },
+  playerPickerEmpty: { color: colors.muted, textAlign: 'center', fontSize: 12, lineHeight: 18, padding: 18 },
   amountInput: {
     backgroundColor: '#1D1C31', borderWidth: 1, borderColor: colors.border,
     borderRadius: 8, color: colors.text, fontSize: 18, paddingHorizontal: 12, paddingVertical: 10,
   },
+  diceRollRow: { flexDirection: 'row', alignItems: 'center', gap: 7, marginTop: 8 },
+  diceFormulaInput: { flex: 1, fontSize: 13, paddingVertical: 8 },
+  rollDiceButton: { borderRadius: 7, backgroundColor: colors.pink, paddingHorizontal: 14, paddingVertical: 10 },
+  rollDiceText: { color: '#fff', fontSize: 12, fontWeight: '700' },
+  formInput: { backgroundColor: '#1D1C31', borderWidth: 1, borderColor: colors.border, borderRadius: 8, color: colors.text, fontSize: 14, paddingHorizontal: 11, paddingVertical: 9 },
+  playerNumberRow: { flexDirection: 'row', gap: 9 },
+  playerNumberField: { flex: 1 },
   fieldLabel: { color: colors.text, fontSize: 12, fontWeight: '600', marginTop: 14, marginBottom: 6 },
   typeScroll: { flexGrow: 0 },
   typeChip: {

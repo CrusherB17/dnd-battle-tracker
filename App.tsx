@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
-import { Pressable, StatusBar, StyleSheet, Text, View } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { Modal, Pressable, StatusBar, StyleSheet, Text, View } from 'react-native';
+import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import BattleScreen from './screens/BattleScreen';
 import MonstersScreen from './screens/MonstersScreen';
 import type { Combatant } from './types/Combatant';
@@ -15,49 +15,69 @@ const tabs: { label: MainTab; icon: string }[] = [
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<MainTab>('Monsters');
-  const [incomingMonster, setIncomingMonster] = useState<Combatant | null>(null);
+  const [incomingMonsters, setIncomingMonsters] = useState<Combatant[]>([]);
+  const [monsterPickerOpen, setMonsterPickerOpen] = useState(false);
 
-  const addMonsterToBattle = (monster: Combatant) => {
-    setIncomingMonster(monster);
+  const addMonsterToBattle = (monsters: Combatant | Combatant[]) => {
+    const newMonsters = Array.isArray(monsters) ? monsters : [monsters];
+    setIncomingMonsters((current) => [...current, ...newMonsters]);
+    setMonsterPickerOpen(false);
     setActiveTab('Battle');
   };
 
   return (
-    <SafeAreaView edges={['top', 'bottom']} style={styles.safeArea}>
-      <StatusBar barStyle="light-content" backgroundColor={colors.header} />
-      <View style={styles.appContent}>
-        <View style={[styles.screen, activeTab !== 'Monsters' && styles.hiddenScreen]}>
-          <MonstersScreen isActive={activeTab === 'Monsters'} onAddToBattle={addMonsterToBattle} />
-        </View>
-        <View style={[styles.screen, activeTab !== 'Battle' && styles.hiddenScreen]}>
-          <BattleScreen incomingMonster={incomingMonster} />
-        </View>
-        <View style={[styles.screen, activeTab !== 'Players' && styles.hiddenScreen]}>
-          <View style={styles.placeholder}>
-            <Text style={styles.placeholderTitle}>Players</Text>
-            <Text style={styles.placeholderText}>Player list is the next section to build.</Text>
+    <SafeAreaProvider>
+      <SafeAreaView edges={['top', 'bottom']} style={styles.safeArea}>
+        <StatusBar barStyle="light-content" backgroundColor={colors.header} />
+        <View style={styles.appContent}>
+          <View style={[styles.screen, activeTab !== 'Monsters' && styles.hiddenScreen]}>
+            <MonstersScreen isActive={activeTab === 'Monsters'} onAddToBattle={addMonsterToBattle} />
+          </View>
+          <View style={[styles.screen, activeTab !== 'Battle' && styles.hiddenScreen]}>
+            <BattleScreen incomingMonsters={incomingMonsters} onOpenMonsters={() => setMonsterPickerOpen(true)} />
+          </View>
+          <View style={[styles.screen, activeTab !== 'Players' && styles.hiddenScreen]}>
+            <View style={styles.placeholder}>
+              <Text style={styles.placeholderTitle}>Players</Text>
+              <Text style={styles.placeholderText}>Player list is the next section to build.</Text>
+            </View>
           </View>
         </View>
-      </View>
 
-      <View style={styles.tabBar}>
-        {tabs.map((tab) => {
-          const selected = activeTab === tab.label;
-          return (
-            <Pressable
-              key={tab.label}
-              accessibilityRole="tab"
-              accessibilityState={{ selected }}
-              onPress={() => setActiveTab(tab.label)}
-              style={styles.tabItem}
-            >
-              <Text style={[styles.tabIcon, selected && styles.selectedTabText]}>{tab.icon}</Text>
-              <Text style={[styles.tabLabel, selected && styles.selectedTabText]}>{tab.label}</Text>
-            </Pressable>
-          );
-        })}
-      </View>
-    </SafeAreaView>
+        <Modal
+          animationType="slide"
+          onRequestClose={() => setMonsterPickerOpen(false)}
+          visible={monsterPickerOpen}
+        >
+          <SafeAreaView edges={['top', 'bottom']} style={styles.pickerModal}>
+            <MonstersScreen
+              isActive={monsterPickerOpen}
+              onAddToBattle={addMonsterToBattle}
+              selectionMode
+              onClosePicker={() => setMonsterPickerOpen(false)}
+            />
+          </SafeAreaView>
+        </Modal>
+
+        <View style={styles.tabBar}>
+          {tabs.map((tab) => {
+            const selected = activeTab === tab.label;
+            return (
+              <Pressable
+                key={tab.label}
+                accessibilityRole="tab"
+                accessibilityState={{ selected }}
+                onPress={() => setActiveTab(tab.label)}
+                style={styles.tabItem}
+              >
+                <Text style={[styles.tabIcon, selected && styles.selectedTabText]}>{tab.icon}</Text>
+                <Text style={[styles.tabLabel, selected && styles.selectedTabText]}>{tab.label}</Text>
+              </Pressable>
+            );
+          })}
+        </View>
+      </SafeAreaView>
+    </SafeAreaProvider>
   );
 }
 
@@ -66,6 +86,7 @@ const colors = { background: '#171729', header: '#292743', muted: '#9997B0', tex
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: colors.header },
   appContent: { flex: 1, backgroundColor: colors.background },
+  pickerModal: { flex: 1, backgroundColor: colors.background },
   screen: { flex: 1 },
   hiddenScreen: { display: 'none' },
   tabBar: {
